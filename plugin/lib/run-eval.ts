@@ -115,6 +115,7 @@ async function runSingleQuery(
   timeout: number,
   projectRoot: string,
   agent: string,
+  triggerOnly: boolean,
   model?: string,
 ): Promise<boolean> {
   if (!SKILL_NAME_RE.test(skillName)) {
@@ -201,10 +202,15 @@ async function runSingleQuery(
       onStdoutChunk(chunk) {
         buffer += chunk
         flushBuffer()
+        return triggerOnly && triggered
       },
     })
 
     flushBuffer(true)
+
+    if (triggered) {
+      return true
+    }
 
     if (isFailedProcess(result)) {
       const cleanedStderr = result.stderr.trim()
@@ -294,6 +300,7 @@ export interface RunEvalOptions {
   projectRoot: string
   runsPerQuery?: number
   triggerThreshold?: number
+  triggerOnly?: boolean
   model?: string
   agent?: string
 }
@@ -314,6 +321,7 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalOutput> {
     projectRoot,
     runsPerQuery = 3,
     triggerThreshold = 0.5,
+    triggerOnly = true,
     model,
     agent = "build",
   } = opts
@@ -348,6 +356,7 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalOutput> {
           timeout,
           projectRoot,
           agent,
+          triggerOnly,
           model,
         )
         jobResults.push({

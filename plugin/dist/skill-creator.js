@@ -12542,7 +12542,19 @@ function runProcess(command, opts) {
     let stderr = "";
     let timedOut = false;
     let settled = false;
+    let stopRequested = false;
     let killTimeoutId;
+    const requestStop = () => {
+      if (settled || stopRequested)
+        return;
+      stopRequested = true;
+      proc.kill();
+      killTimeoutId = setTimeout(() => {
+        if (!settled) {
+          proc.kill("SIGKILL");
+        }
+      }, killGraceMs);
+    };
     const timeoutId = setTimeout(() => {
       timedOut = true;
       proc.kill();
@@ -12555,7 +12567,9 @@ function runProcess(command, opts) {
     proc.stdout.setEncoding("utf-8");
     proc.stdout.on("data", (chunk) => {
       stdout += chunk;
-      opts.onStdoutChunk?.(chunk);
+      const shouldStop = opts.onStdoutChunk?.(chunk);
+      if (shouldStop)
+        requestStop();
     });
     proc.stderr.setEncoding("utf-8");
     proc.stderr.on("data", (chunk) => {
@@ -12624,7 +12638,7 @@ function findProjectRoot(cwd) {
   }
   return cwd ?? process.cwd();
 }
-async function runSingleQuery(query, skillName, skillDescription, timeout, projectRoot, agent, model) {
+async function runSingleQuery(query, skillName, skillDescription, timeout, projectRoot, agent, triggerOnly, model) {
   if (!SKILL_NAME_RE.test(skillName)) {
     throw new Error(`Invalid skill name "${skillName}". Expected kebab-case (lowercase letters, numbers, and hyphens only).`);
   }
@@ -12699,9 +12713,13 @@ async function runSingleQuery(query, skillName, skillDescription, timeout, proje
       onStdoutChunk(chunk) {
         buffer += chunk;
         flushBuffer();
+        return triggerOnly && triggered;
       }
     });
     flushBuffer(true);
+    if (triggered) {
+      return true;
+    }
     if (isFailedProcess(result)) {
       const cleanedStderr = result.stderr.trim();
       throw new Error(cleanedStderr ? `opencode run exited ${result.exitCode}: ${cleanedStderr}` : `opencode run exited ${result.exitCode}`);
@@ -12710,6 +12728,30 @@ async function runSingleQuery(query, skillName, skillDescription, timeout, proje
   } finally {
     if (existsSync2(skillsDir)) {
       rmSync(skillsDir, { recursive: true, force: true });
+    }
+  }
+}
+async function assertNoInstalledSkillConflict(skillName, projectRoot) {
+  try {
+    const proc = Bun.spawn(["opencode", "debug", "skill"], {
+      cwd: projectRoot,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env }
+    });
+    const stdout = await new Response(proc.stdout).text();
+    await proc.exited;
+    const skills = JSON.parse(stdout);
+    if (!Array.isArray(skills))
+      return;
+    const conflicts = skills.filter((s) => s && typeof s === "object" && s.name === skillName);
+    if (conflicts.length === 0)
+      return;
+    const locations = conflicts.map((s) => typeof s.location === "string" ? s.location : "unknown location").join(", ");
+    throw new Error(`skill_eval conflict: skill "${skillName}" is already available to opencode at ${locations}. ` + `Remove that installed skill or its skills.paths entry before running skill_eval. ` + `The eval tool creates a synthetic skill named "${skillName}-skill-<id>" and only counts ` + `that temporary skill as triggered; an installed skill with the base name can steal ` + `triggers and produce false negatives.`);
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith("skill_eval conflict:")) {
+      throw e;
     }
   }
 }
@@ -12723,6 +12765,7 @@ async function runEval(opts) {
     projectRoot,
     runsPerQuery = 3,
     triggerThreshold = 0.5,
+    triggerOnly = true,
     model,
     agent = "build"
   } = opts;
@@ -12740,7 +12783,7 @@ async function runEval(opts) {
       if (!job)
         break;
       try {
-        const triggered = await runSingleQuery(job.item.query, skillName, description, timeout, projectRoot, agent, model);
+        const triggered = await runSingleQuery(job.item.query, skillName, description, timeout, projectRoot, agent, triggerOnly, model);
         jobResults.push({
           query: job.item.query,
           triggered,
@@ -13383,6 +13426,7 @@ async function runLoop(opts) {
     maxIterations,
     runsPerQuery,
     triggerThreshold,
+    triggerOnly,
     holdout,
     model,
     agent,
@@ -13425,6 +13469,7 @@ ${"=".repeat(60)}`);
       projectRoot,
       runsPerQuery,
       triggerThreshold,
+      triggerOnly,
       model,
       agent
     });
@@ -14875,6 +14920,11 @@ async function maybeAutoRefreshPluginCache(options = {}) {
     return { checked: false, cleared: false, reason: "error" };
   }
 }
+function normalizeDescriptionOverride(value) {
+  if (typeof value !== "string")
+    return;
+  return value.trim().length === 0 ? undefined : value;
+}
 var activeServers = new Map;
 var SkillCreatorPlugin = async (ctx) => {
   ensureBundledSkillInstalled({
@@ -14964,6 +15014,7 @@ var SkillCreatorPlugin = async (ctx) => {
           timeout: tool.schema.number().optional().describe("Timeout per query in seconds (default: 30)"),
           runsPerQuery: tool.schema.number().optional().describe("Number of runs per query for reliability (default: 3)"),
           triggerThreshold: tool.schema.number().optional().describe("Trigger rate threshold to count as triggered (default: 0.5)"),
+          triggerOnly: tool.schema.boolean().optional().describe("Stop each eval run as soon as the synthetic skill is triggered and ignore later workflow failures (default: true)"),
           model: tool.schema.string().optional().describe("Model ID in provider/model format"),
           agent: tool.schema.string().optional().describe("OpenCode agent for trigger eval runs (default: build)")
         },
@@ -14976,15 +15027,17 @@ var SkillCreatorPlugin = async (ctx) => {
           }
           const meta = parseSkillMd(args.skillPath);
           const projectRoot = findProjectRoot();
+          await assertNoInstalledSkillConflict(meta.name, projectRoot);
           const result = await runEval({
             evalSet,
             skillName: meta.name,
-            description: args.descriptionOverride ?? meta.description,
+            description: normalizeDescriptionOverride(args.descriptionOverride) ?? meta.description,
             numWorkers: args.numWorkers ?? 10,
             timeout: args.timeout ?? 30,
             projectRoot,
             runsPerQuery: args.runsPerQuery ?? 3,
             triggerThreshold: args.triggerThreshold ?? 0.5,
+            triggerOnly: args.triggerOnly ?? true,
             model: args.model,
             agent: args.agent ?? "build"
           });
@@ -15030,6 +15083,7 @@ var SkillCreatorPlugin = async (ctx) => {
           timeout: tool.schema.number().optional().describe("Timeout per query in seconds (default: 30)"),
           runsPerQuery: tool.schema.number().optional().describe("Runs per query (default: 3)"),
           triggerThreshold: tool.schema.number().optional().describe("Trigger rate threshold (default: 0.5)"),
+          triggerOnly: tool.schema.boolean().optional().describe("Stop each eval run as soon as the synthetic skill is triggered and ignore later workflow failures (default: true)"),
           holdout: tool.schema.number().optional().describe("Test set holdout fraction (default: 0.4)"),
           model: tool.schema.string().optional().describe("Model ID in provider/model format"),
           agent: tool.schema.string().optional().describe("OpenCode agent for trigger eval runs (default: build)"),
@@ -15039,15 +15093,19 @@ var SkillCreatorPlugin = async (ctx) => {
         async execute(args) {
           const { readFileSync: readFileSync8 } = await import("fs");
           const evalSet = JSON.parse(readFileSync8(args.evalSetPath, "utf-8"));
+          const meta = parseSkillMd(args.skillPath);
+          const projectRoot = findProjectRoot();
+          await assertNoInstalledSkillConflict(meta.name, projectRoot);
           const result = await runLoop({
             evalSet,
             skillPath: args.skillPath,
-            descriptionOverride: args.descriptionOverride ?? null,
+            descriptionOverride: normalizeDescriptionOverride(args.descriptionOverride) ?? null,
             numWorkers: args.numWorkers ?? 10,
             timeout: args.timeout ?? 30,
             maxIterations: args.maxIterations ?? 5,
             runsPerQuery: args.runsPerQuery ?? 3,
             triggerThreshold: args.triggerThreshold ?? 0.5,
+            triggerOnly: args.triggerOnly ?? true,
             holdout: args.holdout ?? 0.4,
             model: args.model,
             agent: args.agent ?? "build",
